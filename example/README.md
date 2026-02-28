@@ -9,7 +9,7 @@ formatted Excel workbook with class statistics.
 ```
 example/
 ├── promptfooconfig.yaml       # Eval config with test cases + assertions
-├── provider.js                # Provider setup (CodeInterpreterProvider)
+├── provider.cjs               # Provider setup (CodeInterpreterProvider)
 ├── system_prompt.md           # GPT instructions
 ├── knowledge/
 │   └── grading_rules.py       # Grading logic (uploaded as knowledge file)
@@ -24,24 +24,11 @@ example/
 # Install dependencies
 npm install promptfoo promptfoo-custom-gpt-tools
 
-# Set your API key (or use Codex CLI auth)
+# Set your API key
 export OPENAI_API_KEY="sk-..."
 
 # Run the eval
 npx promptfoo eval -c example/promptfooconfig.yaml
-```
-
-## Auth options
-
-### API key (default)
-```bash
-export OPENAI_API_KEY="sk-..."
-```
-
-### Codex CLI (use ChatGPT subscription)
-```bash
-codex login
-# Then set auth: 'codex' in provider.js
 ```
 
 ## What it tests

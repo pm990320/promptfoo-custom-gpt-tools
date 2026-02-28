@@ -2,18 +2,17 @@
 
 ## Design Principles
 
-1. **Delegate to promptfoo** - Use `loadApiProvider('openai:responses:<model>')` to get a fully configured `OpenAiResponsesProvider`. We inherit all auth, retry, caching, body building, response parsing, and cost calculation.
-2. **Only add what's missing** - Container lifecycle (create, upload, download) and file assertions. Promptfoo's provider handles everything else.
-3. **Support Codex CLI OAuth** - Read tokens from `~/.codex/auth.json` to use ChatGPT subscription quota instead of per-token API billing.
+1. **OpenAI SDK directly** - Uses the `openai` npm package to call the Responses API with Code Interpreter containers.
+2. **Only add what's missing** - Container lifecycle (create, upload, download) and file assertions. The OpenAI SDK handles the API calls.
+3. **Simple auth** - `OPENAI_API_KEY` env var, nothing else.
 
 ## Architecture
 
 ```
 src/
   index.ts          # Public exports
-  provider.ts       # CodeInterpreterProvider - wraps promptfoo's OpenAiResponsesProvider
-  container.ts      # Container lifecycle: create, upload, list, download, cleanup
-  codex-auth.ts     # Read/refresh Codex CLI OAuth tokens from ~/.codex/auth.json
+  provider.ts       # CodeInterpreterProvider - wraps OpenAI Responses API
+  container.ts      # Container lifecycle: create, upload, list, download, cleanup (plain fetch)
   types.ts          # TypeScript interfaces
 assertions/
   index.ts          # Assertion helpers export
@@ -27,53 +26,37 @@ assertions/
 callApi(prompt, context)
   |
   +-- ensureInitialized()
-  |     +-- resolveCodexAuth() or OPENAI_API_KEY
-  |     +-- loadApiProvider('openai:responses:<model>', config)
-  |     +-- new ContainerManager(openaiClient)
+  |     +-- read OPENAI_API_KEY
+  |     +-- new OpenAI({ apiKey })
+  |     +-- new ContainerManager(apiKey)
   |
   +-- containerManager.createOrReuse(knowledgeFiles)
   |     +-- hashKnowledgeFiles() -> check cache -> create if needed
-  |     +-- upload knowledge files
+  |     +-- upload knowledge files via fetch
   |
   +-- upload input files (per test case)
   +-- snapshot container files (before)
-  +-- inject code_interpreter tool with containerId
-  +-- baseProvider.callApi(enrichedPrompt)    <-- promptfoo handles everything
+  +-- client.responses.create() with code_interpreter tool + containerId
   +-- snapshot container files (after)
   +-- download new files (after - before - uploaded)
   +-- return enriched result with file metadata
   +-- cleanup container (per strategy)
 ```
 
-## Auth modes
+## Container API
 
-### API Key (default)
-Standard `OPENAI_API_KEY` env var. Passed to promptfoo's provider as `apiKey` config.
+The OpenAI SDK (v4) doesn't fully expose the Containers file API, so the ContainerManager
+uses plain `fetch()` against `https://api.openai.com/v1/containers/` endpoints:
 
-### Codex CLI OAuth
-Reads `~/.codex/auth.json`:
-```json
-{
-  "auth_mode": "chatgpt",
-  "tokens": {
-    "access_token": "eyJ...",
-    "refresh_token": "...",
-    "id_token": "eyJ...",
-    "account_id": "..."
-  },
-  "last_refresh": "2026-02-28T..."
-}
-```
-
-- Access token used as bearer token (same header format as API key)
-- Auto-refresh via `POST https://auth.openai.com/oauth/token`
-- Cached for 7 min (tokens expire in ~8-10 min)
-- Uses ChatGPT subscription (Plus/Pro) quota, not per-token billing
-- Falls back to `OPENAI_API_KEY` if auth.json has `auth_mode: "api_key"`
+- `POST /containers` - create container
+- `POST /containers/{id}/files` - upload file (multipart/form-data)
+- `GET /containers/{id}/files` - list files
+- `GET /containers/{id}/files/{file_id}/content` - download file
+- `DELETE /containers/{id}` - delete container
 
 ## Key decisions
 
-1. **Composition over inheritance** - We don't extend `OpenAiResponsesProvider` directly because it's not part of promptfoo's public API (ERR_PACKAGE_PATH_NOT_EXPORTED). Instead we use `loadApiProvider` to get an instance and delegate to it.
-2. **Tool injection via provider config mutation** - We modify the loaded provider's `config.tools` array to inject `{ type: 'code_interpreter', container: containerId }` before each call. This ensures the tool appears in the request body built by `getOpenAiBody()`.
-3. **Lazy initialization** - Provider and container manager are created on first `callApi()` because auth resolution and provider loading are async, but `constructor()` must be sync.
-4. **Peer dependency on promptfoo** - We `import('promptfoo')` dynamically at runtime. It must be installed by the consumer (who is running promptfoo evals anyway).
+1. **Plain fetch for container files** - The SDK's `client.containers.files` object exists but doesn't expose upload/list methods properly. Plain fetch with auth header works.
+2. **Lazy initialization** - Provider and container manager are created on first `callApi()` because the constructor must be sync (promptfoo calls `new Provider(config)`).
+3. **Export class, not instance** - promptfoo's `file://` loader expects a class it can instantiate with `new Class(options)`. The `.cjs` provider file exports the class.
+4. **Container reuse** - Knowledge files are hashed by filename + content. Same hash reuses an existing container to avoid re-uploading static files per test case.

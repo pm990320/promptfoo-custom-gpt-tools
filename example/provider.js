@@ -12,8 +12,4 @@ export default new CodeInterpreterProvider({
   },
   output_dir: './eval_output',
   timeout_ms: 120000,
-
-  // Use Codex CLI OAuth - tokens from /tmp/codex-auth-test/
-  auth: 'codex',
-  codex_home: '/tmp/codex-auth-test',
 });
