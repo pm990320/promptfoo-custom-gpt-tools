@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.eval_output/
+eval_output/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+example/eval_output/
