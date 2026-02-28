@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import OpenAI from 'openai';
 import { ContainerManager } from './container.js';
 import { resolveCodexAuth } from './codex-auth.js';
 import type {
@@ -8,26 +9,12 @@ import type {
   UploadedContainerFile,
 } from './types.js';
 
-/**
- * Promptfoo provider/response types.
- * We use the shapes from promptfoo's public API rather than importing
- * internal classes, so we stay compatible across promptfoo versions.
- */
 interface ProviderResponse {
   output?: string;
   error?: string;
   tokenUsage?: { total?: number; prompt?: number; completion?: number };
   cost?: number;
   metadata?: Record<string, unknown>;
-}
-
-interface ApiProvider {
-  id(): string;
-  callApi(
-    prompt: string,
-    context?: Record<string, unknown>,
-    options?: Record<string, unknown>,
-  ): Promise<ProviderResponse>;
 }
 
 interface CallContext {
@@ -49,18 +36,14 @@ function renderTemplate(template: string, vars: Record<string, unknown>): string
 }
 
 /**
- * Promptfoo custom provider that wraps OpenAiResponsesProvider with
- * container lifecycle management for Code Interpreter file-processing evals.
- *
- * Uses promptfoo's `loadApiProvider` (stable public API) to create the
- * underlying responses provider, so we inherit all auth handling, body
- * building, caching, error handling, cost calculation, etc.
+ * Promptfoo provider that wraps OpenAI Responses API with Code Interpreter.
+ * This version uses the OpenAI SDK directly to avoid recursive loading issues
+ * with promptfoo's loadApiProvider.
  */
-export class CodeInterpreterProvider implements ApiProvider {
+export class CodeInterpreterProvider {
   private readonly config: CodeInterpreterProviderConfig;
-  private baseProvider: ApiProvider | undefined;
+  private client: OpenAI | undefined;
   private containerManager: ContainerManager | undefined;
-  private initPromise: Promise<void> | undefined;
 
   constructor(config: CodeInterpreterProviderConfig) {
     this.config = {
@@ -77,78 +60,44 @@ export class CodeInterpreterProvider implements ApiProvider {
   }
 
   /**
-   * Lazy-initialize the underlying promptfoo provider and container manager.
-   * We do this lazily because resolveCodexAuth is async and loadApiProvider
-   * returns a promise.
+   * Lazy-initialize the OpenAI client and container manager.
    */
   private async ensureInitialized(): Promise<void> {
-    if (this.baseProvider) return;
+    if (this.client && this.containerManager) return;
 
-    this.initPromise ??= this.initialize();
-
-    await this.initPromise;
-  }
-
-  private async initialize(): Promise<void> {
     // Resolve auth
-    let apiKey: string | undefined;
+    let apiKey: string;
 
     if (this.config.auth === 'codex') {
       apiKey = await resolveCodexAuth(this.config.codex_home);
     } else {
-      apiKey = process.env.OPENAI_API_KEY;
+      apiKey = process.env['OPENAI_API_KEY'] ?? '';
     }
 
     if (!apiKey) {
       throw new Error(
-        'No API key available. Set OPENAI_API_KEY or use auth: "codex" with "codex login".',
+        'No API key. Set OPENAI_API_KEY or use auth: "codex" with "codex login".',
       );
     }
 
-    // Load instructions if file:// reference
-    let instructions = this.config.instructions;
-    if (instructions?.startsWith('file://')) {
-      const filePath = instructions.slice('file://'.length);
-      const absolute = path.isAbsolute(filePath)
-        ? filePath
-        : path.resolve(this.resolveBaseDir(), filePath);
-      instructions = await fs.readFile(absolute, 'utf8');
-    }
-
-    // Build promptfoo provider config
-    const providerConfig: Record<string, unknown> = {
-      apiKey,
-      ...(instructions ? { instructions } : {}),
-      ...(this.config.provider_config ?? {}),
-    };
-
-    // Use promptfoo's public loadApiProvider to get a properly configured
-    // OpenAiResponsesProvider. This handles all auth, retry, caching, body
-    // building, response parsing, and cost calculation.
-    const { loadApiProvider } = await import('promptfoo');
-    this.baseProvider = (await loadApiProvider(
-      `openai:responses:${this.config.model}`,
-      { options: { config: providerConfig } },
-    )) as ApiProvider;
-
-    // Initialize container manager with the same API key
-    const OpenAI = (await import('openai')).default;
-    const client = new OpenAI({ apiKey });
-    this.containerManager = new ContainerManager(client);
+    this.client = new OpenAI({ apiKey });
+    this.containerManager = new ContainerManager(this.client);
   }
 
   async callApi(
     prompt: string,
     context?: CallContext,
-    options?: Record<string, unknown>,
+    _options?: Record<string, unknown>,
   ): Promise<ProviderResponse> {
     await this.ensureInitialized();
 
-    const containerMgr = this.containerManager;
-    const baseProvider = this.baseProvider;
-    if (!containerMgr || !baseProvider) {
+    const containerMgr = this.containerManager!;
+    const client = this.client!;
+
+    if (!containerMgr || !client) {
       throw new Error('Provider not initialized');
     }
+
     const cleanupStrategy = this.config.container?.cleanup ?? 'on-success';
     const allowReuse = this.config.container?.reuse_by_knowledge_hash ?? true;
 
@@ -156,8 +105,18 @@ export class CodeInterpreterProvider implements ApiProvider {
     let knowledgeHash = '';
 
     try {
-      const vars = (context?.vars ?? {});
+      const vars = (context?.vars ?? {}) as Record<string, unknown>;
       const baseDir = this.resolveBaseDir();
+
+      // Resolve instructions
+      let instructions = this.config.instructions;
+      if (instructions?.startsWith('file://')) {
+        const filePath = instructions.slice('file://'.length);
+        const absolute = path.isAbsolute(filePath)
+          ? filePath
+          : path.resolve(baseDir, filePath);
+        instructions = await fs.readFile(absolute, 'utf8');
+      }
 
       // Resolve file paths
       const knowledgeFiles = await this.resolveFiles(
@@ -196,7 +155,7 @@ export class CodeInterpreterProvider implements ApiProvider {
         ...uploadedInputFiles.map((f) => f.id),
       ]);
 
-      // Build the enriched prompt with file references
+      // Build the prompt with file references
       const messageLines = [prompt.trim()];
       if (uploadedInputFiles.length > 0) {
         messageLines.push('');
@@ -207,26 +166,13 @@ export class CodeInterpreterProvider implements ApiProvider {
       }
       const enrichedPrompt = messageLines.join('\n').trim();
 
-      // Inject code_interpreter tool with our container into the provider.
-      // We modify the provider's config to include the tool, which getOpenAiBody()
-      // will pick up when building the request body.
-      const providerRecord = baseProvider as unknown as {
-        config?: Record<string, unknown>;
-      };
-      if (providerRecord.config) {
-        const rawTools = providerRecord.config.tools;
-        const existingTools: unknown[] = Array.isArray(rawTools) ? rawTools : [];
-        providerRecord.config.tools = [
-          ...existingTools.filter(
-            (t) =>
-              !(t && typeof t === 'object' && (t as Record<string, unknown>).type === 'code_interpreter'),
-          ),
-          { type: 'code_interpreter', container: containerId },
-        ];
-      }
-
-      // Delegate the actual API call to promptfoo's provider
-      const result = await baseProvider.callApi(enrichedPrompt, context, options);
+      // Call the Responses API with code_interpreter tool
+      const response = await this.callResponsesApi(
+        client,
+        containerId,
+        instructions,
+        enrichedPrompt,
+      );
 
       // Download newly created files from the container
       const afterFiles = await containerMgr.listContainerFiles(containerId);
@@ -238,11 +184,12 @@ export class CodeInterpreterProvider implements ApiProvider {
         uploadedIds,
       });
 
-      // Enrich the result with file metadata
-      const enrichedResult: ProviderResponse = {
-        ...result,
+      // Build the result
+      const result: ProviderResponse = {
+        output: response.outputText,
+        tokenUsage: response.usage,
+        cost: response.cost,
         metadata: {
-          ...(result.metadata ?? {}),
           outputFiles,
           containerFiles: afterFiles.map((f) => f.filename),
           containerId,
@@ -254,7 +201,7 @@ export class CodeInterpreterProvider implements ApiProvider {
         await containerMgr.cleanupContainer(containerId, knowledgeHash);
       }
 
-      return enrichedResult;
+      return result;
     } catch (error) {
       if (containerId && cleanupStrategy === 'always') {
         await containerMgr.cleanupContainer(containerId, knowledgeHash);
@@ -264,6 +211,59 @@ export class CodeInterpreterProvider implements ApiProvider {
         metadata: { containerId: containerId || undefined },
       };
     }
+  }
+
+  private async callResponsesApi(
+    client: OpenAI,
+    containerId: string,
+    instructions: string | undefined,
+    prompt: string,
+  ): Promise<{
+    outputText: string;
+    usage?: { total?: number; prompt?: number; completion?: number };
+    cost?: number;
+  }> {
+    // Build the request similar to promptfoo's OpenAiResponsesProvider
+    const tools = [{ type: 'code_interpreter' as const, container: containerId }];
+
+    const response = await client.responses.create({
+      model: this.config.model,
+      ...(instructions ? { instructions } : {}),
+      input: [{ role: 'user' as const, content: [{ type: 'input_text' as const, text: prompt }] }],
+      tools,
+      text: { format: { type: 'text' as const } },
+    });
+
+    // Extract output text
+    let outputText = '';
+    if (response.output_text) {
+      outputText = response.output_text;
+    } else if (response.output) {
+      const chunks: string[] = [];
+      for (const item of response.output) {
+        if ('content' in item && Array.isArray(item.content)) {
+          for (const block of item.content) {
+            if ('text' in block && typeof block.text === 'string') {
+              chunks.push(block.text);
+            }
+          }
+        }
+      }
+      outputText = chunks.join('\n').trim();
+    }
+
+    // Extract usage
+    const usage = response.usage
+      ? {
+          total: response.usage.total_tokens,
+          prompt: response.usage.input_tokens,
+          completion: response.usage.output_tokens,
+        }
+      : undefined;
+
+    // Note: cost calculation would require pricing data - omitting for simplicity
+
+    return { outputText, usage, cost: undefined };
   }
 
   private async downloadNewFiles(params: {
@@ -320,6 +320,3 @@ export class CodeInterpreterProvider implements ApiProvider {
     return results;
   }
 }
-
-// Re-export for convenience
-export { hashKnowledgeFiles } from './container.js';

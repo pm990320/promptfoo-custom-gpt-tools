@@ -1,18 +1,19 @@
-const { CodeInterpreterProvider } = require('promptfoo-custom-gpt-tools');
+import { CodeInterpreterProvider } from '../dist/index.js';
 
-module.exports = new CodeInterpreterProvider({
+export default new CodeInterpreterProvider({
   model: 'gpt-5.2',
-  instructions: 'file://./example/system_prompt.md',
-  knowledge_files: ['./example/knowledge/grading_rules.py'],
+  instructions: 'file://./system_prompt.md',
+  knowledge_files: ['./knowledge/grading_rules.py'],
   input_files: ['{{input_file}}'],
   container: {
     memory_limit: '4g',
     cleanup: 'on-success',
     reuse_by_knowledge_hash: true,
   },
-  output_dir: './example/eval_output',
+  output_dir: './eval_output',
   timeout_ms: 120000,
 
-  // Uncomment to use Codex CLI OAuth instead of OPENAI_API_KEY:
-  // auth: 'codex',
+  // Use Codex CLI OAuth - tokens from /tmp/codex-auth-test/
+  auth: 'codex',
+  codex_home: '/tmp/codex-auth-test',
 });

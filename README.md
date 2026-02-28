@@ -208,3 +208,15 @@ npm run build
 ## License
 
 MIT
+
+## Limitations
+
+### Codex OAuth Scope
+
+The Codex CLI OAuth tokens are generated for the Codex service, not for direct API access. They may lack the `api.responses.write` scope required for the Responses API. 
+
+If you get a 401 "Missing scopes" error when using `auth: 'codex'`, you'll need to:
+1. Use a standard API key (`auth: 'api-key'`, set `OPENAI_API_KEY`)
+2. Or generate OAuth tokens with API permissions (different OAuth client setup)
+
+The Codex OAuth path works for authentication but may fail at the API call stage depending on your organization's API permissions.
