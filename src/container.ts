@@ -1,9 +1,7 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import type OpenAI from 'openai';
-import type { ContainerFileEntry, UploadedContainerFile } from './types';
+import type { ContainerFileEntry, UploadedContainerFile } from './types.js';
 
 interface CachedContainer {
   containerId: string;
@@ -24,25 +22,7 @@ interface CreateOrReuseResult {
 }
 
 const containerCache = new Map<string, CachedContainer>();
-
-function toFilename(input: unknown): string {
-  if (!input) return '';
-  if (typeof input === 'string') return input;
-  if (typeof input === 'object') {
-    const record = input as Record<string, unknown>;
-    const direct = record.filename ?? record.name ?? record.path;
-    if (typeof direct === 'string') return direct;
-  }
-  // eslint-disable-next-line @typescript-eslint/no-base-to-string -- deliberately stringifying unknown API values
-  return String(input);
-}
-
-function getId(input: unknown): string {
-  if (!input || typeof input !== 'object') return '';
-  const record = input as Record<string, unknown>;
-  const id = record.id ?? record.file_id;
-  return typeof id === 'string' ? id : '';
-}
+const BASE_URL = 'https://api.openai.com/v1';
 
 async function hashFile(filePath: string): Promise<string> {
   const data = await fsp.readFile(filePath);
@@ -61,8 +41,23 @@ export async function hashKnowledgeFiles(files: string[]): Promise<string> {
   return crypto.createHash('sha256').update(entries.join('|')).digest('hex');
 }
 
+async function apiJson<T>(apiKey: string, url: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      ...(init?.headers as Record<string, string> | undefined),
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`OpenAI API ${res.status}: ${body}`);
+  }
+  return (await res.json()) as T;
+}
+
 export class ContainerManager {
-  constructor(private readonly client: OpenAI) {}
+  constructor(private readonly apiKey: string) {}
 
   async createOrReuse(params: CreateOrReuseParams): Promise<CreateOrReuseResult> {
     const knowledgeHash = await hashKnowledgeFiles(params.knowledgeFiles);
@@ -83,189 +78,77 @@ export class ContainerManager {
     const uploadedKnowledgeFileIds = new Set<string>();
 
     for (const filePath of params.knowledgeFiles) {
-      const uploaded = await this.uploadFileToContainer(containerId, filePath);
+      const uploaded = await this.uploadFile(containerId, filePath);
       uploadedKnowledgeFileIds.add(uploaded.id);
     }
 
     containerCache.set(knowledgeHash, { containerId, knowledgeHash });
 
-    return {
-      containerId,
-      knowledgeHash,
-      reused: false,
-      uploadedKnowledgeFileIds,
-    };
+    return { containerId, knowledgeHash, reused: false, uploadedKnowledgeFileIds };
   }
 
   async createContainer(memoryLimit?: '1g' | '4g' | '16g' | '64g'): Promise<string> {
-    const api = this.client as unknown as {
-      containers?: {
-        create?: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
-      };
-    };
+    const body: Record<string, unknown> = { name: 'promptfoo-eval' };
+    if (memoryLimit) body.memory_limit = memoryLimit;
 
-    if (!api.containers?.create) {
-      throw new Error('OpenAI SDK does not expose client.containers.create(). Please upgrade openai package.');
-    }
+    const result = await apiJson<{ id: string }>(
+      this.apiKey,
+      `${BASE_URL}/containers`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
 
-    const payload: Record<string, unknown> = {
-      name: 'promptfoo-custom-gpt-tools',
-    };
-
-    if (memoryLimit) payload.memory_limit = memoryLimit;
-
-    const created = await api.containers.create(payload);
-    const containerId = getId(created) || (created.id as string | undefined);
-
-    if (!containerId) {
-      throw new Error(`Container creation returned no id: ${JSON.stringify(created)}`);
-    }
-
-    return containerId;
+    return result.id;
   }
 
-  async uploadFileToContainer(containerId: string, filePath: string): Promise<UploadedContainerFile> {
-    const fileApi = this.client.files as unknown as {
-      create: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
-    };
+  async uploadFile(containerId: string, filePath: string): Promise<UploadedContainerFile> {
+    const fileData = await fsp.readFile(filePath);
+    const filename = path.basename(filePath);
 
-    const uploadedFile = await fileApi.create({
-      file: fs.createReadStream(filePath),
-      purpose: 'assistants',
-    });
+    const form = new FormData();
+    form.append('file', new Blob([fileData]), filename);
 
-    const fileId = getId(uploadedFile) || (uploadedFile.id as string | undefined);
-    if (!fileId) {
-      throw new Error(`File upload returned no id for ${filePath}`);
-    }
+    const result = await apiJson<{ id: string; path: string }>(
+      this.apiKey,
+      `${BASE_URL}/containers/${containerId}/files`,
+      { method: 'POST', body: form },
+    );
 
-    await this.attachFileToContainer(containerId, fileId);
-
-    return {
-      id: fileId,
-      filename: path.basename(filePath),
-      localPath: filePath,
-    };
+    return { id: result.id, filename, localPath: filePath };
   }
 
-  async attachFileToContainer(containerId: string, fileId: string): Promise<void> {
-    const api = this.client as unknown as {
-      containers?: {
-        files?: {
-          create?: (...args: unknown[]) => Promise<unknown>;
-        };
-      };
-    };
+  async listFiles(containerId: string): Promise<ContainerFileEntry[]> {
+    const result = await apiJson<{ data: { id: string; path: string }[] }>(
+      this.apiKey,
+      `${BASE_URL}/containers/${containerId}/files`,
+    );
 
-    const create = api.containers?.files?.create;
-    if (!create) return;
-
-    try {
-      await create(containerId, { file_id: fileId });
-      return;
-    } catch {
-      // fallback for alternate signature
-    }
-
-    await create({ container_id: containerId, file_id: fileId });
+    return result.data.map((f) => ({
+      id: f.id,
+      filename: path.basename(f.path),
+    }));
   }
 
-  async listContainerFiles(containerId: string): Promise<ContainerFileEntry[]> {
-    const api = this.client as unknown as {
-      containers?: {
-        files?: {
-          list?: (...args: unknown[]) => Promise<Record<string, unknown>>;
-        };
-      };
-    };
-
-    const list = api.containers?.files?.list;
-    if (!list) return [];
-
-    let result: Record<string, unknown>;
-    try {
-      result = await list(containerId);
-    } catch {
-      result = await list({ container_id: containerId });
-    }
-
-    const rawData = result.data;
-    const data: unknown[] = Array.isArray(rawData) ? rawData : [];
-
-    return data
-      .map((entry) => {
-        const id = getId(entry);
-        const filename = toFilename(entry);
-        if (!id) return null;
-        return {
-          id,
-          filename: filename || id,
-        } satisfies ContainerFileEntry;
-      })
-      .filter((entry): entry is ContainerFileEntry => Boolean(entry));
-  }
-
-  async downloadFileToPath(containerId: string, fileId: string, destinationPath: string): Promise<void> {
+  async downloadFile(containerId: string, fileId: string, destinationPath: string): Promise<void> {
     await fsp.mkdir(path.dirname(destinationPath), { recursive: true });
 
-    const containerApi = this.client as unknown as {
-      containers?: {
-        files?: {
-          content?: (...args: unknown[]) => Promise<unknown>;
-        };
-      };
-    };
+    const res = await fetch(
+      `${BASE_URL}/containers/${containerId}/files/${fileId}/content`,
+      { headers: { Authorization: `Bearer ${this.apiKey}` } },
+    );
 
-    const content = containerApi.containers?.files?.content;
-
-    let response: unknown;
-    if (content) {
-      try {
-        response = await content(containerId, fileId);
-      } catch {
-        response = await content({ container_id: containerId, file_id: fileId });
-      }
-    } else {
-      const filesApi = this.client.files as unknown as {
-        content?: (id: string) => Promise<unknown>;
-      };
-      if (!filesApi.content) {
-        throw new Error('OpenAI SDK does not expose file content download API.');
-      }
-      response = await filesApi.content(fileId);
+    if (!res.ok) {
+      throw new Error(`Download failed ${res.status}: ${await res.text()}`);
     }
 
-    const buffer = await this.toBuffer(response);
+    const buffer = Buffer.from(await res.arrayBuffer());
     await fsp.writeFile(destinationPath, buffer);
   }
 
-  async toBuffer(response: unknown): Promise<Buffer> {
-    if (Buffer.isBuffer(response)) return response;
-    if (typeof response === 'string') return Buffer.from(response, 'utf8');
-    if (response && typeof response === 'object') {
-      const maybeArrayBuffer = response as {
-        arrayBuffer?: () => Promise<ArrayBuffer>;
-        text?: () => Promise<string>;
-      };
-      if (typeof maybeArrayBuffer.arrayBuffer === 'function') {
-        const arr = await maybeArrayBuffer.arrayBuffer();
-        return Buffer.from(arr);
-      }
-      if (typeof maybeArrayBuffer.text === 'function') {
-        const text = await maybeArrayBuffer.text();
-        return Buffer.from(text, 'utf8');
-      }
-    }
-    throw new Error('Unable to convert API response to Buffer');
-  }
-
-  async cleanupContainer(containerId: string, knowledgeHash?: string): Promise<void> {
-    const api = this.client as unknown as {
-      containers?: {
-        delete?: (...args: unknown[]) => Promise<unknown>;
-      };
-    };
-
+  async deleteContainer(containerId: string, knowledgeHash?: string): Promise<void> {
     if (knowledgeHash) {
       const cached = containerCache.get(knowledgeHash);
       if (cached?.containerId === containerId) {
@@ -273,13 +156,13 @@ export class ContainerManager {
       }
     }
 
-    const remove = api.containers?.delete;
-    if (!remove) return;
-
     try {
-      await remove(containerId);
+      await fetch(`${BASE_URL}/containers/${containerId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${this.apiKey}` },
+      });
     } catch {
-      await remove({ container_id: containerId });
+      // Best effort cleanup
     }
   }
 

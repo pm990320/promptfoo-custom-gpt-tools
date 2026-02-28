@@ -1,6 +1,5 @@
 export { CodeInterpreterProvider } from './provider.js';
 export { ContainerManager, hashKnowledgeFiles } from './container.js';
-export { resolveCodexAuth } from './codex-auth.js';
 export type {
   CodeInterpreterProviderConfig,
   ContainerConfig,

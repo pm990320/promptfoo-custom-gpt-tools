@@ -32,19 +32,6 @@ export interface CodeInterpreterProviderConfig {
   container?: ContainerConfig;
 
   /**
-   * Auth mode.
-   * - 'api-key': Use OPENAI_API_KEY env var (default)
-   * - 'codex': Read OAuth tokens from Codex CLI (~/.codex/auth.json)
-   */
-  auth?: 'api-key' | 'codex';
-
-  /**
-   * Path to Codex home directory (default: ~/.codex).
-   * Only used when auth = 'codex'.
-   */
-  codex_home?: string;
-
-  /**
    * Additional promptfoo OpenAI provider config options.
    * These are passed through to the underlying OpenAiResponsesProvider.
    * Supports: reasoning, reasoning_effort, temperature, top_p,

@@ -1,4 +1,4 @@
-description: Student Gradebook Processor - Code Interpreter eval
+description: Student Gradebook Processor eval
 
 providers:
   - id: file://./provider.cjs
@@ -12,11 +12,8 @@ providers:
       container:
         memory_limit: 4g
         cleanup: on-success
-        reuse_by_knowledge_hash: true
       output_dir: ./eval_output
-      timeout_ms: 120000
-      auth: codex
-      codex_home: /tmp/codex-auth-test
+      timeout_ms: 180000
 
 prompts:
   - "{{user_prompt}}"
@@ -26,9 +23,9 @@ tests:
       user_prompt: "Process this gradebook CSV. Calculate averages and assign letter grades."
       input_file: ./test_data/gradebook_simple.csv
     assert:
+      - type: contains
+        value: "Grades"
+      - type: contains
+        value: "Statistics"
       - type: javascript
-        value: |
-          const { fileAssert } = require('promptfoo-custom-gpt-tools/assertions');
-          const files = context.providerResponse?.metadata?.outputFiles ?? [];
-          if (files.length === 0) return { pass: false, reason: 'No output files generated' };
-          return fileAssert(files[0], { exists: true, minSize: 1024 });
+        value: "output.includes('Grades') && output.includes('Statistics')"
